@@ -1,0 +1,148 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DustinKieler <dustinkieler@gmail.com>
+Date: Sun, 7 Aug 2022 13:44:13 -0500
+Subject: [PATCH] Allow sand duping and make bees less forgetful of their hive
+
+
+diff --git a/src/main/java/net/minecraft/world/entity/Entity.java b/src/main/java/net/minecraft/world/entity/Entity.java
+index f925a8d550ecbf2044a37bfe58b30d6578c5f6af..ed954ea4b1312a6350d47e20c0b57c21f7f39e85 100644
+--- a/src/main/java/net/minecraft/world/entity/Entity.java
++++ b/src/main/java/net/minecraft/world/entity/Entity.java
+@@ -460,37 +460,6 @@ public abstract class Entity implements Nameable, EntityAccess, CommandSource {
+         return chunkMap.playerEntityTrackerTrackMaps[type.ordinal()].getObjectsInRange(MCUtil.getCoordinateKey(this));
+     }
+     // Paper end - optimise entity tracking
+-    // Paper start - make end portalling safe
+-    public BlockPos portalBlock;
+-    public ServerLevel portalWorld;
+-    public void tickEndPortal() {
+-        BlockPos pos = this.portalBlock;
+-        ServerLevel world = this.portalWorld;
+-        this.portalBlock = null;
+-        this.portalWorld = null;
+-
+-        if (pos == null || world == null || world != this.level) {
+-            return;
+-        }
+-
+-        if (this.isPassenger() || this.isVehicle() || !this.canChangeDimensions() || this.isRemoved() || !this.valid || !this.isAlive()) {
+-            return;
+-        }
+-
+-        ResourceKey<Level> resourcekey = world.getTypeKey() == LevelStem.END ? Level.OVERWORLD : Level.END; // CraftBukkit - SPIGOT-6152: send back to main overworld in custom ends
+-        ServerLevel worldserver = world.getServer().getLevel(resourcekey);
+-
+-        org.bukkit.event.entity.EntityPortalEnterEvent event = new org.bukkit.event.entity.EntityPortalEnterEvent(this.getBukkitEntity(), new org.bukkit.Location(world.getWorld(), pos.getX(), pos.getY(), pos.getZ()));
+-        event.callEvent();
+-
+-        if (this instanceof ServerPlayer) {
+-            ((ServerPlayer)this).changeDimension(worldserver, PlayerTeleportEvent.TeleportCause.END_PORTAL);
+-            return;
+-        }
+-        this.teleportTo(worldserver, null);
+-    }
+-    // Paper end - make end portalling safe
+-
+     // Paper start
+     /**
+      * Overriding this field will cause memory leaks.
+@@ -2884,7 +2853,6 @@ public abstract class Entity implements Nameable, EntityAccess, CommandSource {
+             }
+ 
+             this.processPortalCooldown();
+-            this.tickEndPortal(); // Paper - make end portalling safe
+         }
+     }
+ 
+diff --git a/src/main/java/net/minecraft/world/entity/animal/Bee.java b/src/main/java/net/minecraft/world/entity/animal/Bee.java
+index a9cdf9034ad269f7a71358443acc053288cfbe6d..b46133eab734e32e9612e5847845306bd173266a 100644
+--- a/src/main/java/net/minecraft/world/entity/animal/Bee.java
++++ b/src/main/java/net/minecraft/world/entity/animal/Bee.java
+@@ -1006,7 +1006,7 @@ public class Bee extends Animal implements NeutralMob, FlyingAnimal {
+             PoiManager villageplace = ((ServerLevel) Bee.this.level).getPoiManager();
+             Stream<PoiRecord> stream = villageplace.getInRange((holder) -> {
+                 return holder.is(PoiTypeTags.BEE_HOME);
+-            }, blockposition, 20, PoiManager.Occupancy.ANY);
++            }, blockposition, 200, PoiManager.Occupancy.ANY);
+ 
+             return (List) stream.map(PoiRecord::getPos).filter(Bee.this::doesHiveHaveSpace).sorted(Comparator.comparingDouble((blockposition1) -> {
+                 return blockposition1.distSqr(blockposition);
+@@ -1062,19 +1062,19 @@ public class Bee extends Animal implements NeutralMob, FlyingAnimal {
+         public void tick() {
+             if (Bee.this.hivePos != null) {
+                 ++this.travellingTicks;
+-                if (this.travellingTicks > this.adjustedTickDelay(600)) {
++                if (this.travellingTicks > this.adjustedTickDelay(600)) { // Traveling for 30 seconds, forget it and roam for awhile, then try again on a new hive
+                     this.dropAndBlacklistHive();
+                 } else if (!Bee.this.navigation.isInProgress()) {
+                     if (!Bee.this.closerThan(Bee.this.hivePos, 16)) {
+                         if (Bee.this.isTooFarAway(Bee.this.hivePos)) {
+-                            this.dropHive();
++                            this.pathfindDirectlyTowards(Bee.this.hivePos);
+                         } else {
+                             Bee.this.pathfindRandomlyTowards(Bee.this.hivePos);
+                         }
+                     } else {
+                         boolean flag = this.pathfindDirectlyTowards(Bee.this.hivePos);
+ 
+-                        if (!flag) {
++                        if (!flag) { // No path to the hive, forget about it
+                             this.dropAndBlacklistHive();
+                         } else if (this.lastPath != null && Bee.this.navigation.getPath().sameAs(this.lastPath)) {
+                             ++this.ticksStuck;
+diff --git a/src/main/java/net/minecraft/world/entity/item/FallingBlockEntity.java b/src/main/java/net/minecraft/world/entity/item/FallingBlockEntity.java
+index ef07967b64180c54338b8fb2ba1780adec87f333..5b1d4ff8233ce36cfb832847d4f10b9baa871abf 100644
+--- a/src/main/java/net/minecraft/world/entity/item/FallingBlockEntity.java
++++ b/src/main/java/net/minecraft/world/entity/item/FallingBlockEntity.java
+@@ -127,11 +127,6 @@ public class FallingBlockEntity extends Entity {
+ 
+     @Override
+     public void tick() {
+-        // Paper start - fix sand duping
+-        if (this.isRemoved()) {
+-            return;
+-        }
+-        // Paper end - fix sand duping
+         if (this.blockState.isAir()) {
+             this.discard();
+         } else {
+@@ -144,12 +139,6 @@ public class FallingBlockEntity extends Entity {
+ 
+             this.move(MoverType.SELF, this.getDeltaMovement());
+ 
+-            // Paper start - fix sand duping
+-            if (this.isRemoved()) {
+-                return;
+-            }
+-            // Paper end - fix sand duping
+-
+             // Paper start - Configurable EntityFallingBlock height nerf
+             if (this.level.paperConfig().fixes.fallingBlockHeightNerf != 0 && this.getY() > this.level.paperConfig().fixes.fallingBlockHeightNerf) {
+                 if (this.dropItem && this.level.getGameRules().getBoolean(GameRules.RULE_DOENTITYDROPS)) {
+diff --git a/src/main/java/net/minecraft/world/level/block/EndPortalBlock.java b/src/main/java/net/minecraft/world/level/block/EndPortalBlock.java
+index 15c5cccfe02c924c02f605eb47dd0b420b189891..6652854d81e77ea25c1314444aa00a60ed5bd12f 100644
+--- a/src/main/java/net/minecraft/world/level/block/EndPortalBlock.java
++++ b/src/main/java/net/minecraft/world/level/block/EndPortalBlock.java
+@@ -53,12 +53,17 @@ public class EndPortalBlock extends BaseEntityBlock {
+                 // return; // CraftBukkit - always fire event in case plugins wish to change it
+             }
+ 
+-            // Paper start - move all of this logic into portal tick
+-            entity.portalWorld = ((ServerLevel)world);
+-            entity.portalBlock = pos.immutable();
+-            // Paper end - move all of this logic into portal tick
+-        }
++            // CraftBukkit start - Entity in portal
++            EntityPortalEnterEvent event = new EntityPortalEnterEvent(entity.getBukkitEntity(), new org.bukkit.Location(world.getWorld(), pos.getX(), pos.getY(), pos.getZ()));
++            world.getCraftServer().getPluginManager().callEvent(event);
++            if (entity instanceof ServerPlayer) {
++                ((ServerPlayer) entity).changeDimension(worldserver, PlayerTeleportEvent.TeleportCause.END_PORTAL);
++                return;
++            }
++            // CraftBukkit end
+ 
++            entity.changeDimension(worldserver);
++        }
+     }
+ 
+     @Override
